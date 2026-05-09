@@ -31,7 +31,7 @@ export default function HolidaySync() {
       <p className="text-xs text-gray-400 mb-6">
         資料來源：
         <a
-          href="https://www.1823.gov.hk/common/ical/gc/tc.ic"
+          href="https://www.1823.gov.hk/common/ical/gc/tc.ics"
           target="_blank"
           rel="noreferrer"
           className="text-lark-blue underline"

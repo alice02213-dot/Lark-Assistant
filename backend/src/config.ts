@@ -9,7 +9,7 @@ const config = Object.freeze({
     appId: required("LARK_APP_ID"),
     appSecret: required("LARK_APP_SECRET"),
     calendarId: process.env.LARK_CALENDAR_ID ?? "primary",
-    baseUrl: "https://open.feishu.cn/open-apis",
+    baseUrl: "https://open.larksuite.com/open-apis",
   },
   cron: {
     timezone: process.env.CRON_TIMEZONE ?? "Asia/Hong_Kong",

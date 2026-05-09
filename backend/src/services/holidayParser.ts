@@ -1,8 +1,11 @@
 import fetch from "node-fetch";
+import https from "https";
 import ical from "node-ical";
+
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 import type { CalendarEvent } from "../lark/calendar";
 
-const HK_ICAL_URL = "https://www.1823.gov.hk/common/ical/gc/tc.ic";
+const HK_ICAL_URL = "https://www.1823.gov.hk/common/ical/gc/tc.ics";
 
 function toIsoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -15,7 +18,7 @@ function addOneDay(dateStr: string): string {
 }
 
 export async function fetchHKHolidays(): Promise<CalendarEvent[]> {
-  const res = await fetch(HK_ICAL_URL);
+  const res = await fetch(HK_ICAL_URL, { agent: httpsAgent });
   if (!res.ok) throw new Error(`Failed to fetch iCal: ${res.status}`);
   const text = await res.text();
 

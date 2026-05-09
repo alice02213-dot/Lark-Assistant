@@ -1,3 +1,13 @@
+import dotenv from "dotenv";
+import path from "path";
+
+const envPath = path.resolve(__dirname, "../../.env");
+const dotenvResult = dotenv.config({ path: envPath, override: true });
+if (dotenvResult.error) {
+  console.warn(`[dotenv] Failed to load ${envPath}:`, dotenvResult.error.message);
+} else {
+  console.log(`[dotenv] Loaded ${envPath} — LARK_APP_ID=${process.env.LARK_APP_ID}`);
+}
 import express from "express";
 import cors from "cors";
 import config from "./config";
