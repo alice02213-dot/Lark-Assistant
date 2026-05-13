@@ -4,6 +4,7 @@ const navItems = [
   { to: "/rooms", label: "預約會議室", icon: "🏢" },
   { to: "/holidays", label: "香港假期同步", icon: "📅" },
   { to: "/birthdays", label: "生日快樂祝福", icon: "🎂" },
+  { to: "/users", label: "組織成員", icon: "👥" },
 ];
 
 export default function Layout() {
