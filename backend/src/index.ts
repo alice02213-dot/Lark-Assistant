@@ -14,6 +14,8 @@ import config from "./config";
 import router from "./routes";
 import errorHandler from "./middleware/errorHandler";
 import { start as startBirthdayScheduler } from "./services/birthdayScheduler";
+import { start as startRecruitmentDigest } from "./services/recruitmentDigest";
+import { start as startInternSalary } from "./services/internSalaryScheduler";
 
 const app = express();
 
@@ -28,4 +30,6 @@ app.use(errorHandler);
 app.listen(config.port, () => {
   console.log(`Backend listening on port ${config.port}`);
   startBirthdayScheduler();
+  startRecruitmentDigest();
+  startInternSalary();
 });

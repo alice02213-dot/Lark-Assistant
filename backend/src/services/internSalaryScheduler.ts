@@ -1,0 +1,410 @@
+import cron from "node-cron";
+import fs from "fs";
+import path from "path";
+import config from "../config";
+import larkClient from "../lark/client";
+import { sendTextMessage } from "../lark/im";
+
+// --- Data source: the "Current Intern List" table in the HR onboarding Base. ---
+const APP_TOKEN = "UbLybT4uHaJAahsZneVlYOLQgyd";
+const TABLE_ID = "tbl4u8YLTihmnOi4";
+const RECIPIENT_OPEN_ID = "ou_d648150b253127ad14a385d808cdd947"; // Dora Huang
+
+// --- Salary rules (RMB) ---------------------------------------------------------
+// 3-month short contract: 8000/mo. 6-month long contract: 10000/mo.
+// "3+3續約": started on a 3-month short (8000/mo for months 1-3), then upgraded to
+// a 6-month long contract — so month 4 pays 10000 plus a one-time 6000 backfill of
+// the (10000-8000)*3 difference for months 1-3; months 5+ are 10000/mo.
+const RATE_SHORT = 8000;
+const RATE_LONG = 10000;
+const BACKFILL = (RATE_LONG - RATE_SHORT) * 3; // 6000
+
+const TRACK_SHORT = "3個月短期";
+const TRACK_LONG = "6個月長期(直簽)";
+const TRACK_RENEW = "3+3續約";
+
+const SENT_FILE = path.join(config.dataDir, "salary-sent.json");
+
+interface BitableRecord {
+  record_id: string;
+  fields: Record<string, any>;
+}
+
+async function fetchAllRecords(tableId: string): Promise<BitableRecord[]> {
+  const all: BitableRecord[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await larkClient.get(`/bitable/v1/apps/${APP_TOKEN}/tables/${tableId}/records`, {
+      params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+    });
+    all.push(...(res.data.data?.items ?? []));
+    pageToken = res.data.data?.has_more ? res.data.data?.page_token : undefined;
+  } while (pageToken);
+  return all;
+}
+
+// --- Date helpers ---------------------------------------------------------------
+// Lark date fields arrive as epoch-ms at UTC midnight of the stored date, so we do
+// all calendar reasoning in UTC to avoid timezone drift.
+
+/** Add n calendar months to a UTC date (ms), clamping the day to the target month. */
+function addMonthsUTC(ms: number, n: number): number {
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth();
+  const day = d.getUTCDate();
+  const targetMonthDays = new Date(Date.UTC(y, m + n + 1, 0)).getUTCDate();
+  const clampedDay = Math.min(day, targetMonthDays);
+  return Date.UTC(y, m + n, clampedDay);
+}
+
+function daysInMonthUTC(year: number, month0: number): number {
+  return new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+}
+
+/**
+ * Contract-month index (1-based) that a given day falls into, anchored on the
+ * onboard day-of-month. e.g. onboard May 17 → month 1 = May17–Jun16, month 2 =
+ * Jun17–Jul16, ... A day before onboard returns 0.
+ */
+function contractMonthIndex(onboardMs: number, dayMs: number): number {
+  if (dayMs < onboardMs) return 0;
+  let elapsed = 0;
+  while (addMonthsUTC(onboardMs, elapsed + 1) <= dayMs) elapsed++;
+  return elapsed + 1;
+}
+
+/**
+ * Lark stores date fields as tenant-local midnight (e.g. 2026-08-07 shows up as
+ * 2026-08-06T16:00Z for a UTC+8 tenant). Re-read the intended calendar date in the
+ * configured timezone and return it as a UTC-midnight ms, so every day-count below
+ * is timezone-safe rather than a day early.
+ */
+function larkDateToUTCDate(ms: number): number {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: config.cron.timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    })
+      .formatToParts(new Date(ms))
+      .map((x) => [x.type, x.value])
+  );
+  return Date.UTC(parseInt(p.year, 10), parseInt(p.month, 10) - 1, parseInt(p.day, 10));
+}
+
+/** Per-day monthly-rate basis for an intern, given their track and the day's contract month. */
+function monthlyRateForDay(track: string, monthIdx: number): number {
+  switch (track) {
+    case TRACK_SHORT:
+      return RATE_SHORT;
+    case TRACK_LONG:
+      return RATE_LONG;
+    case TRACK_RENEW:
+      return monthIdx <= 3 ? RATE_SHORT : RATE_LONG;
+    default:
+      return NaN; // unknown / unset track
+  }
+}
+
+export interface SalaryRow {
+  name: string;
+  track: string | null;
+  activeDays: number;
+  daysInMonth: number;
+  activeFrom: number; // first active day-of-month (0 if none)
+  activeTo: number; // last active day-of-month (0 if none)
+  fullMonth: boolean;
+  base: number; // prorated base pay (excludes backfill)
+  backfill: number; // 0 or 6000
+  total: number;
+  leaving: boolean; // cessation falls within this month
+  starting: boolean; // onboard falls within this month
+  unset: boolean; // track not set → cannot compute
+}
+
+/** Compute one intern's pay for a given calendar month. Returns null if not active that month. */
+export function computeRow(rec: BitableRecord, year: number, month0: number): SalaryRow | null {
+  const f = rec.fields;
+  const name = f["Name"] ?? "(未命名)";
+  const onboardRaw = f["Onboard Date"] as number | undefined;
+  const cessationRaw = f["Cessation Date"] as number | undefined;
+  const track = (f["薪資類別"] as string | undefined) ?? null;
+
+  if (!onboardRaw) return null;
+  // Normalise Lark's tenant-local-midnight timestamps to UTC-midnight of the
+  // intended calendar date before any day arithmetic.
+  const onboard = larkDateToUTCDate(onboardRaw);
+  const cessation = cessationRaw != null ? larkDateToUTCDate(cessationRaw) : undefined;
+
+  const daysInMonth = daysInMonthUTC(year, month0);
+  const monthStart = Date.UTC(year, month0, 1);
+  const monthEnd = Date.UTC(year, month0, daysInMonth);
+
+  // Active window this month = [onboard, cessation] ∩ [monthStart, monthEnd], inclusive.
+  const effCessation = cessation ?? Number.MAX_SAFE_INTEGER;
+  if (onboard > monthEnd || effCessation < monthStart) return null; // not active this month
+
+  const unset = track === null || Number.isNaN(monthlyRateForDay(track, 1));
+
+  let base = 0;
+  let activeDays = 0;
+  let activeFrom = 0; // first active day-of-month
+  let activeTo = 0; // last active day-of-month
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dayMs = Date.UTC(year, month0, day);
+    if (dayMs < onboard || dayMs > effCessation) continue;
+    activeDays++;
+    if (activeFrom === 0) activeFrom = day;
+    activeTo = day;
+    if (!unset) {
+      const idx = contractMonthIndex(onboard, dayMs);
+      base += monthlyRateForDay(track!, idx) / daysInMonth;
+    }
+  }
+
+  // One-time 6000 backfill lands in the calendar month that contains the start of
+  // contract month 4 (onboard + 3 months) — only for the 3+3 renewal track, and
+  // only if the intern actually reaches month 4 (i.e. hasn't left before it starts).
+  // The latter guard stops a boundary-case leaver from being paid a backfill for a
+  // month-4 they never worked.
+  let backfill = 0;
+  if (track === TRACK_RENEW) {
+    const m4StartMs = addMonthsUTC(onboard, 3);
+    const m4Start = new Date(m4StartMs);
+    const reachesM4 = effCessation >= m4StartMs;
+    if (reachesM4 && m4Start.getUTCFullYear() === year && m4Start.getUTCMonth() === month0) {
+      backfill = BACKFILL;
+    }
+  }
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  return {
+    name,
+    track,
+    activeDays,
+    daysInMonth,
+    activeFrom,
+    activeTo,
+    fullMonth: activeDays === daysInMonth,
+    base: round2(base),
+    backfill,
+    total: round2(base + backfill),
+    leaving: !!cessation && cessation >= monthStart && cessation <= monthEnd,
+    starting: onboard >= monthStart && onboard <= monthEnd,
+    unset,
+  };
+}
+
+// --- Payday assembly (20th-of-month cut-off + deferral) -------------------------
+// Payroll runs on the 20th. An intern who onboards on/after the 20th of a month
+// misses that month's run; that (partial) month's pay is deferred and paid on the
+// NEXT payday alongside the next month's salary. This is a timing rule only — the
+// per-month amounts are still the calendar-month prorated figures from computeRow.
+const CUTOFF_DAY = 20;
+
+export interface PaydayLine {
+  name: string;
+  track: string | null;
+  unset: boolean;
+  onboardDay: number;
+  current: SalaryRow | null; // this calendar month's pay
+  deferredOut: boolean; // current month deferred to NEXT payday (onboarded ≥20 this month)
+  catchUp: SalaryRow | null; // previous month's pay, caught up on this payday
+  catchUpMonth: number; // 1-based previous month (for labelling)
+  paydayTotal: number;
+}
+
+/** Assemble what an intern is actually paid on the payday of (year, month) — the
+ *  current month unless it was deferred out, plus any deferred previous month. */
+export function computePayday(rec: BitableRecord, year: number, month: number): PaydayLine | null {
+  const month0 = month - 1;
+  const f = rec.fields;
+  const name = f["Name"] ?? "(未命名)";
+  const onboardRaw = f["Onboard Date"] as number | undefined;
+  if (!onboardRaw) return null;
+
+  const onboard = larkDateToUTCDate(onboardRaw);
+  const od = new Date(onboard);
+  const onboardDay = od.getUTCDate();
+  const onboardY = od.getUTCFullYear();
+  const onboardM0 = od.getUTCMonth();
+
+  const current = computeRow(rec, year, month0);
+  const deferredOut =
+    !!current && onboardY === year && onboardM0 === month0 && onboardDay >= CUTOFF_DAY;
+
+  // Previous calendar month (handles year rollover).
+  let py = year;
+  let pm0 = month0 - 1;
+  if (pm0 < 0) {
+    pm0 = 11;
+    py = year - 1;
+  }
+  const onboardedPrevLate = onboardY === py && onboardM0 === pm0 && onboardDay >= CUTOFF_DAY;
+  const catchUp = onboardedPrevLate ? computeRow(rec, py, pm0) : null;
+
+  if (!current && !catchUp) return null; // nothing on this payday
+
+  const track = current?.track ?? catchUp?.track ?? null;
+  const unset = current?.unset ?? catchUp?.unset ?? false;
+
+  const currentPayable = current && !deferredOut && !current.unset ? current.total : 0;
+  const catchUpPayable = catchUp && !catchUp.unset ? catchUp.total : 0;
+  const paydayTotal = Math.round((currentPayable + catchUpPayable) * 100) / 100;
+
+  return { name, track, unset, onboardDay, current, deferredOut, catchUp, catchUpMonth: pm0 + 1, paydayTotal };
+}
+
+export interface SalaryReport {
+  year: number;
+  month: number; // 1-based
+  lines: PaydayLine[];
+  total: number;
+  unsetCount: number;
+  text: string;
+}
+
+const fmtMoney = (n: number) =>
+  n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/** Describe the active days of a monthly row, e.g. "整月" or "做7天（8/1–8/7，當月共31天）". */
+function daysDesc(row: SalaryRow, monthNum: number): string {
+  if (row.fullMonth) return "整月";
+  return `做${row.activeDays}天（${monthNum}/${row.activeFrom}–${monthNum}/${row.activeTo}，當月共${row.daysInMonth}天）`;
+}
+
+/** Build the full salary report for a payday (1-based month, disbursed on the 20th). */
+export async function buildSalaryReport(year: number, month: number): Promise<SalaryReport> {
+  const records = await fetchAllRecords(TABLE_ID);
+
+  const lines: PaydayLine[] = [];
+  for (const r of records) {
+    const line = computePayday(r, year, month);
+    if (line) lines.push(line);
+  }
+  lines.sort((a, b) => a.name.localeCompare(b.name));
+
+  const total = lines.filter((l) => !l.unset).reduce((s, l) => s + l.paydayTotal, 0);
+  const unsetCount = lines.filter((l) => l.unset).length;
+
+  const ym = `${year}-${String(month).padStart(2, "0")}`;
+  const out: string[] = [`💰 Intern 薪資結算 ${ym}（20號發薪，${lines.length} 位）`, ""];
+
+  for (const l of lines) {
+    if (l.unset) {
+      out.push(`• ${l.name}　⚠️ 未設定薪資類別，無法計算`);
+      continue;
+    }
+
+    const curFlags = (r: SalaryRow): string => {
+      const flags: string[] = [];
+      if (r.backfill > 0) flags.push(`含補差${r.backfill}`);
+      if (r.starting) flags.push("🆕本月入職");
+      if (r.leaving) flags.push("⚠️本月離職");
+      return flags.length ? "（" + flags.join("、") + "）" : "";
+    };
+
+    // Case 1: onboarded on/after the 20th this month → deferred, nothing paid now.
+    if (l.deferredOut && !l.catchUp) {
+      out.push(
+        `• ${l.name}　${l.track}　🆕${month}/${l.onboardDay}入職（≥20號）→ 本月不發，順延至下月一併發放（0.00）`
+      );
+      continue;
+    }
+
+    // Case 2: plain current month, no deferral in or out → compact one-liner.
+    if (!l.catchUp && l.current && !l.deferredOut) {
+      out.push(
+        `• ${l.name}　${l.track}　${daysDesc(l.current, month)}　${fmtMoney(l.current.total)}${curFlags(l.current)}`
+      );
+      continue;
+    }
+
+    // Case 3: this payday carries a caught-up previous month (± the current month).
+    const segs: string[] = [];
+    if (l.catchUp) {
+      segs.push(`補發${l.catchUpMonth}月 ${daysDesc(l.catchUp, l.catchUpMonth)} ${fmtMoney(l.catchUp.total)}`);
+    }
+    if (l.current && !l.deferredOut) {
+      segs.push(`本月 ${daysDesc(l.current, month)} ${fmtMoney(l.current.total)}${curFlags(l.current)}`);
+    }
+    out.push(`• ${l.name}　${l.track}　${segs.join("　＋　")}　＝　${fmtMoney(l.paydayTotal)}`);
+  }
+
+  out.push("", `本月合計：${fmtMoney(total)} 元人民幣`);
+  if (unsetCount > 0) {
+    out.push("", `⚠️ 有 ${unsetCount} 位尚未設定「薪資類別」，未計入合計，請到 Base 補上後重跑。`);
+  }
+
+  return { year, month, lines, total, unsetCount, text: out.join("\n") };
+}
+
+// --- Current payroll month in the configured timezone ---------------------------
+function currentYearMonthInTz(): { year: number; month: number; monthKey: string } {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: config.cron.timezone,
+    year: "numeric",
+    month: "2-digit",
+  });
+  const p = Object.fromEntries(fmt.formatToParts(new Date()).map((x) => [x.type, x.value]));
+  const year = parseInt(p.year, 10);
+  const month = parseInt(p.month, 10);
+  return { year, month, monthKey: `${p.year}-${p.month}` };
+}
+
+// --- "already sent" log so we send at most once per payroll month ---------------
+type SentLog = Record<string, boolean>;
+
+function readSentLog(): SentLog {
+  if (!fs.existsSync(SENT_FILE)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(SENT_FILE, "utf-8")) as SentLog;
+  } catch {
+    return {};
+  }
+}
+
+function writeSentLog(log: SentLog): void {
+  const keys = Object.keys(log).sort();
+  while (keys.length > 24) delete log[keys.shift()!]; // keep ~2 years
+  fs.writeFileSync(SENT_FILE, JSON.stringify(log, null, 2), "utf-8");
+}
+
+/** Send this month's salary summary to Dora, unless already sent this month. Idempotent. */
+export async function sendMonthlySalary(opts?: { force?: boolean }): Promise<{
+  sent: boolean;
+  report: SalaryReport;
+}> {
+  const { year, month, monthKey } = currentYearMonthInTz();
+  const log = readSentLog();
+  if (log[monthKey] && !opts?.force) {
+    const report = await buildSalaryReport(year, month);
+    console.log(`[intern-salary] already sent for ${monthKey}, skipping`);
+    return { sent: false, report };
+  }
+
+  const report = await buildSalaryReport(year, month);
+  await sendTextMessage(RECIPIENT_OPEN_ID, report.text);
+  log[monthKey] = true;
+  writeSentLog(log);
+  console.log(`[intern-salary] sent salary summary for ${monthKey}`);
+  return { sent: true, report };
+}
+
+let task: cron.ScheduledTask | null = null;
+
+export function start() {
+  // In-process cron at 09:00 on the 20th of each month, in the configured timezone.
+  task = cron.schedule(
+    "0 9 20 * *",
+    () => void sendMonthlySalary().catch((e) => console.error("[intern-salary] error:", e)),
+    { timezone: config.cron.timezone }
+  );
+  console.log(`Intern salary scheduler started (TZ: ${config.cron.timezone})`);
+}
+
+export function stop() {
+  task?.stop();
+}

@@ -5,7 +5,11 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "send-birthdays": "ts-node --transpile-only src/send-birthdays.ts",
+    "send-salary": "ts-node --transpile-only src/send-salary.ts",
+    "salary-preview": "ts-node --transpile-only src/salary-preview.ts",
+    "salary-selftest": "ts-node --transpile-only src/salary-selftest.ts"
   },
   "dependencies": {
     "axios": "^1.7.2",
@@ -25,6 +29,7 @@
     "@types/node-fetch": "^2.6.11",
     "@types/uuid": "^10.0.0",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "xlsx": "^0.18.5"
   }
 }
