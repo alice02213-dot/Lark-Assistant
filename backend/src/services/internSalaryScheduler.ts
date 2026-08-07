@@ -5,9 +5,11 @@ import config from "../config";
 import larkClient from "../lark/client";
 import { sendTextMessage } from "../lark/im";
 
-// --- Data source: the "Current Intern List" table in the HR onboarding Base. ---
+// --- Data source: the "在職數據" table in the HR Base. It holds both full-time
+// staff and interns, so salary calc filters to Kind === "intern". ---
 const APP_TOKEN = "UbLybT4uHaJAahsZneVlYOLQgyd";
-const TABLE_ID = "tbl4u8YLTihmnOi4";
+const TABLE_ID = "tblTLJVQrrhpbZ2p";
+const INTERN_KIND = "intern";
 const RECIPIENT_OPEN_ID = "ou_d648150b253127ad14a385d808cdd947"; // Dora Huang
 
 // --- Salary rules (RMB) ---------------------------------------------------------
@@ -278,9 +280,11 @@ function daysDesc(row: SalaryRow, monthNum: number): string {
 /** Build the full salary report for a payday (1-based month, disbursed on the 20th). */
 export async function buildSalaryReport(year: number, month: number): Promise<SalaryReport> {
   const records = await fetchAllRecords(TABLE_ID);
+  // The table mixes full-time staff and interns — only interns are on this payroll.
+  const interns = records.filter((r) => r.fields.Kind === INTERN_KIND);
 
   const lines: PaydayLine[] = [];
-  for (const r of records) {
+  for (const r of interns) {
     const line = computePayday(r, year, month);
     if (line) lines.push(line);
   }
