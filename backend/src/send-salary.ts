@@ -10,8 +10,10 @@ import { sendMonthlySalary } from "./services/internSalaryScheduler";
 (async () => {
   const ts = new Date().toISOString();
   const r = await sendMonthlySalary();
-  console.log(`[send-salary] ${ts} sent=${r.sent} total=${r.report.total} unset=${r.report.unsetCount}`);
-  process.exit(0);
+  console.log(
+    `[send-salary] ${ts} sentTo=[${r.sentTo.join(", ")}] skipped=[${r.skipped.join(", ")}] failed=[${r.failed.join(", ")}] unset=${r.report.unsetCount}`
+  );
+  process.exit(r.failed.length > 0 ? 1 : 0);
 })().catch((e) => {
   console.error("[send-salary] FATAL", e);
   process.exit(1);

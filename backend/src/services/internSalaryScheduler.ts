@@ -3,14 +3,20 @@ import fs from "fs";
 import path from "path";
 import config from "../config";
 import larkClient from "../lark/client";
-import { sendTextMessage } from "../lark/im";
+import { sendTextMessage, type ReceiveIdType } from "../lark/im";
 
 // --- Data source: the "在職數據" table in the HR Base. It holds both full-time
 // staff and interns, so salary calc filters to Kind === "intern". ---
 const APP_TOKEN = "UbLybT4uHaJAahsZneVlYOLQgyd";
 const TABLE_ID = "tblTLJVQrrhpbZ2p";
 const INTERN_KIND = "intern";
-const RECIPIENT_OPEN_ID = "ou_d648150b253127ad14a385d808cdd947"; // Dora Huang
+
+// The monthly summary goes to these people on the 20th. `key` is used only in the
+// sent-log so each person is delivered to at most once per month.
+const RECIPIENTS: { key: string; name: string; receiveId: string; idType: ReceiveIdType }[] = [
+  { key: "dora", name: "Dora Huang", receiveId: "ou_d648150b253127ad14a385d808cdd947", idType: "open_id" },
+  { key: "chenjie", name: "Chen Jie", receiveId: "jchen@cloudalphacap.com", idType: "email" },
+];
 
 // --- Salary rules (RMB) ---------------------------------------------------------
 // 3-month short contract: 8000/mo. 6-month long contract: 10000/mo.
@@ -375,8 +381,10 @@ function currentYearMonthInTz(): { year: number; month: number; monthKey: string
   return { year, month, monthKey: `${p.year}-${p.month}` };
 }
 
-// --- "already sent" log so we send at most once per payroll month ---------------
-type SentLog = Record<string, boolean>;
+// --- "already sent" log: { "YYYY-MM": ["recipientKey", ...] } — each recipient is
+// delivered to at most once per payroll month, so a retry only fills in whoever
+// was missed (e.g. a transient failure) without re-spamming those already sent.
+type SentLog = Record<string, string[]>;
 
 function readSentLog(): SentLog {
   if (!fs.existsSync(SENT_FILE)) return {};
@@ -393,25 +401,42 @@ function writeSentLog(log: SentLog): void {
   fs.writeFileSync(SENT_FILE, JSON.stringify(log, null, 2), "utf-8");
 }
 
-/** Send this month's salary summary to Dora, unless already sent this month. Idempotent. */
+/** Send this month's salary summary to every configured recipient, skipping anyone
+ *  already sent to this month (unless force). Idempotent per recipient. */
 export async function sendMonthlySalary(opts?: { force?: boolean }): Promise<{
-  sent: boolean;
+  sentTo: string[];
+  skipped: string[];
+  failed: string[];
   report: SalaryReport;
 }> {
   const { year, month, monthKey } = currentYearMonthInTz();
+  const report = await buildSalaryReport(year, month);
+
   const log = readSentLog();
-  if (log[monthKey] && !opts?.force) {
-    const report = await buildSalaryReport(year, month);
-    console.log(`[intern-salary] already sent for ${monthKey}, skipping`);
-    return { sent: false, report };
+  const already = new Set(opts?.force ? [] : log[monthKey] ?? []);
+  const sentTo: string[] = [];
+  const skipped: string[] = [];
+  const failed: string[] = [];
+
+  for (const r of RECIPIENTS) {
+    if (already.has(r.key)) {
+      skipped.push(r.name);
+      continue;
+    }
+    try {
+      await sendTextMessage(r.receiveId, report.text, r.idType);
+      already.add(r.key);
+      sentTo.push(r.name);
+      console.log(`[intern-salary] sent ${monthKey} to ${r.name}`);
+    } catch (err) {
+      failed.push(r.name);
+      console.error(`[intern-salary] failed to send ${monthKey} to ${r.name}:`, err);
+    }
   }
 
-  const report = await buildSalaryReport(year, month);
-  await sendTextMessage(RECIPIENT_OPEN_ID, report.text);
-  log[monthKey] = true;
+  log[monthKey] = [...already];
   writeSentLog(log);
-  console.log(`[intern-salary] sent salary summary for ${monthKey}`);
-  return { sent: true, report };
+  return { sentTo, skipped, failed, report };
 }
 
 let task: cron.ScheduledTask | null = null;

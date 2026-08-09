@@ -21,7 +21,7 @@ router.get("/preview", async (req, res, next) => {
 router.post("/test", async (_req, res, next) => {
   try {
     const result = await sendMonthlySalary({ force: true });
-    res.json({ ok: true, sent: result.sent, text: result.report.text });
+    res.json({ ok: true, sentTo: result.sentTo, failed: result.failed, text: result.report.text });
   } catch (err) {
     next(err);
   }
