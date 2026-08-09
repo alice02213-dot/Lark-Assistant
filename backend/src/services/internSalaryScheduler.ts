@@ -21,9 +21,18 @@ const RATE_SHORT = 8000;
 const RATE_LONG = 10000;
 const BACKFILL = (RATE_LONG - RATE_SHORT) * 3; // 6000
 
-const TRACK_SHORT = "3個月短期";
-const TRACK_LONG = "6個月長期(直簽)";
-const TRACK_RENEW = "3+3續約";
+// The 薪資類別 single-select label is matched by KEYWORD, not exact string, so the
+// classification survives Dora relabelling the options (e.g. adding "(8K)" suffixes).
+// The raw label is still shown verbatim in the report.
+type Track = "SHORT" | "LONG" | "RENEW";
+
+function classifyTrack(raw: string | null | undefined): Track | null {
+  if (!raw) return null;
+  if (raw.includes("3+3") || raw.includes("續約")) return "RENEW";
+  if (raw.includes("6個月") || raw.includes("長期")) return "LONG";
+  if (raw.includes("3個月") || raw.includes("短期")) return "SHORT";
+  return null;
+}
 
 const SENT_FILE = path.join(config.dataDir, "salary-sent.json");
 
@@ -97,13 +106,13 @@ function larkDateToUTCDate(ms: number): number {
 }
 
 /** Per-day monthly-rate basis for an intern, given their track and the day's contract month. */
-function monthlyRateForDay(track: string, monthIdx: number): number {
-  switch (track) {
-    case TRACK_SHORT:
+function monthlyRateForDay(track: string | null, monthIdx: number): number {
+  switch (classifyTrack(track)) {
+    case "SHORT":
       return RATE_SHORT;
-    case TRACK_LONG:
+    case "LONG":
       return RATE_LONG;
-    case TRACK_RENEW:
+    case "RENEW":
       return monthIdx <= 3 ? RATE_SHORT : RATE_LONG;
     default:
       return NaN; // unknown / unset track
@@ -172,7 +181,7 @@ export function computeRow(rec: BitableRecord, year: number, month0: number): Sa
   // The latter guard stops a boundary-case leaver from being paid a backfill for a
   // month-4 they never worked.
   let backfill = 0;
-  if (track === TRACK_RENEW) {
+  if (classifyTrack(track) === "RENEW") {
     const m4StartMs = addMonthsUTC(onboard, 3);
     const m4Start = new Date(m4StartMs);
     const reachesM4 = effCessation >= m4StartMs;
@@ -268,16 +277,59 @@ export interface SalaryReport {
   text: string;
 }
 
-const fmtMoney = (n: number) =>
-  n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
 /** Describe the active days of a monthly row, e.g. "整月" or "做7天（8/1–8/7，當月共31天）". */
 function daysDesc(row: SalaryRow, monthNum: number): string {
   if (row.fullMonth) return "整月";
   return `做${row.activeDays}天（${monthNum}/${row.activeFrom}–${monthNum}/${row.activeTo}，當月共${row.daysInMonth}天）`;
 }
 
-/** Build the full salary report for a payday (1-based month, disbursed on the 20th). */
+// Group each intern by the primary thing happening on this payday, so like goes
+// with like. First match wins (onboard > leave > 3+3 > deferred catch-up > steady).
+type Category = "onboard" | "leave" | "renew" | "deferred" | "steady";
+
+function category(l: PaydayLine): Category {
+  if (l.current?.starting || l.deferredOut) return "onboard"; // onboarded this month
+  if (l.current?.leaving) return "leave";
+  if (classifyTrack(l.track) === "RENEW") return "renew";
+  if (l.catchUp) return "deferred";
+  return "steady";
+}
+
+const GROUPS: { cat: Category; title: string }[] = [
+  { cat: "onboard", title: "🆕 本月入職" },
+  { cat: "leave", title: "🔚 本月離職" },
+  { cat: "renew", title: "🔁 3+3續約" },
+  { cat: "deferred", title: "🔄 順延補發（上月下旬入職）" },
+  { cat: "steady", title: "✅ 一般在職" },
+];
+
+/** Render one intern's line — work days only, no salary amounts. The salary track
+ *  (with wage base) is shown; onboard/leave are conveyed by the group header. */
+function renderLine(l: PaydayLine, month: number): string {
+  const label = l.track ?? "?"; // show the Base's own label (already carries the wage base)
+  if (l.unset) return `• ${l.name}　⚠️ 未設定薪資類別`;
+
+  const backfillFlag = l.current && l.current.backfill > 0 ? "　✅含補差" : "";
+
+  // Onboarded on/after the 20th this month → deferred, nothing paid now.
+  if (l.deferredOut && !l.catchUp) {
+    return `• ${l.name}　${label}　🆕${month}/${l.onboardDay}入職（≥20號）→ 本月順延至下月一併發放`;
+  }
+
+  // Plain current month, no deferral in or out.
+  if (!l.catchUp && l.current && !l.deferredOut) {
+    return `• ${l.name}　${label}　${daysDesc(l.current, month)}${backfillFlag}`;
+  }
+
+  // Carries a caught-up previous month (± the current month).
+  const segs: string[] = [];
+  if (l.catchUp) segs.push(`補發${l.catchUpMonth}月 ${daysDesc(l.catchUp, l.catchUpMonth)}`);
+  if (l.current && !l.deferredOut) segs.push(`本月 ${daysDesc(l.current, month)}${backfillFlag}`);
+  return `• ${l.name}　${label}　${segs.join("　＋　")}`;
+}
+
+/** Build the full salary report for a payday (1-based month, disbursed on the 20th).
+ *  Work days only (no amounts); grouped by event so like sits with like. */
 export async function buildSalaryReport(year: number, month: number): Promise<SalaryReport> {
   const records = await fetchAllRecords(TABLE_ID);
   // The table mixes full-time staff and interns — only interns are on this payroll.
@@ -288,58 +340,23 @@ export async function buildSalaryReport(year: number, month: number): Promise<Sa
     const line = computePayday(r, year, month);
     if (line) lines.push(line);
   }
-  lines.sort((a, b) => a.name.localeCompare(b.name));
 
   const total = lines.filter((l) => !l.unset).reduce((s, l) => s + l.paydayTotal, 0);
   const unsetCount = lines.filter((l) => l.unset).length;
 
   const ym = `${year}-${String(month).padStart(2, "0")}`;
-  const out: string[] = [`💰 Intern 薪資結算 ${ym}（20號發薪，${lines.length} 位）`, ""];
+  const out: string[] = [`💰 Intern 薪資結算 ${ym}（20號發薪，${lines.length} 位）`];
 
-  for (const l of lines) {
-    if (l.unset) {
-      out.push(`• ${l.name}　⚠️ 未設定薪資類別，無法計算`);
-      continue;
-    }
-
-    const curFlags = (r: SalaryRow): string => {
-      const flags: string[] = [];
-      if (r.backfill > 0) flags.push(`含補差${r.backfill}`);
-      if (r.starting) flags.push("🆕本月入職");
-      if (r.leaving) flags.push("⚠️本月離職");
-      return flags.length ? "（" + flags.join("、") + "）" : "";
-    };
-
-    // Case 1: onboarded on/after the 20th this month → deferred, nothing paid now.
-    if (l.deferredOut && !l.catchUp) {
-      out.push(
-        `• ${l.name}　${l.track}　🆕${month}/${l.onboardDay}入職（≥20號）→ 本月不發，順延至下月一併發放（0.00）`
-      );
-      continue;
-    }
-
-    // Case 2: plain current month, no deferral in or out → compact one-liner.
-    if (!l.catchUp && l.current && !l.deferredOut) {
-      out.push(
-        `• ${l.name}　${l.track}　${daysDesc(l.current, month)}　${fmtMoney(l.current.total)}${curFlags(l.current)}`
-      );
-      continue;
-    }
-
-    // Case 3: this payday carries a caught-up previous month (± the current month).
-    const segs: string[] = [];
-    if (l.catchUp) {
-      segs.push(`補發${l.catchUpMonth}月 ${daysDesc(l.catchUp, l.catchUpMonth)} ${fmtMoney(l.catchUp.total)}`);
-    }
-    if (l.current && !l.deferredOut) {
-      segs.push(`本月 ${daysDesc(l.current, month)} ${fmtMoney(l.current.total)}${curFlags(l.current)}`);
-    }
-    out.push(`• ${l.name}　${l.track}　${segs.join("　＋　")}　＝　${fmtMoney(l.paydayTotal)}`);
+  const byName = (a: PaydayLine, b: PaydayLine) => a.name.localeCompare(b.name);
+  for (const g of GROUPS) {
+    const members = lines.filter((l) => category(l) === g.cat).sort(byName);
+    if (!members.length) continue;
+    out.push("", g.title);
+    for (const l of members) out.push(renderLine(l, month));
   }
 
-  out.push("", `本月合計：${fmtMoney(total)} 元人民幣`);
   if (unsetCount > 0) {
-    out.push("", `⚠️ 有 ${unsetCount} 位尚未設定「薪資類別」，未計入合計，請到 Base 補上後重跑。`);
+    out.push("", `⚠️ 有 ${unsetCount} 位尚未設定「薪資類別」，請到 Base 補上。`);
   }
 
   return { year, month, lines, total, unsetCount, text: out.join("\n") };
