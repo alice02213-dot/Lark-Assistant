@@ -16,6 +16,7 @@ const INTERN_KIND = "intern";
 const RECIPIENTS: { key: string; name: string; receiveId: string; idType: ReceiveIdType }[] = [
   { key: "dora", name: "Dora Huang", receiveId: "ou_d648150b253127ad14a385d808cdd947", idType: "open_id" },
   { key: "chenjie", name: "Chen Jie", receiveId: "jchen@cloudalphacap.com", idType: "email" },
+  { key: "peideyan", name: "Peide Yan", receiveId: "ou_8cab08e5e167821ce24d5d9ea0ab48a3", idType: "open_id" },
 ];
 
 // --- Salary rules (RMB) ---------------------------------------------------------
