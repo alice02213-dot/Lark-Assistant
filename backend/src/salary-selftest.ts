@@ -52,7 +52,7 @@ check("TZ: cessation 8/7 → 7 active days", t4d.activeDays, 7);
 check("TZ: last active day = 7", t4d.activeTo, 7);
 check("TZ: pay = 8000/31*7", t4d.total, Math.round((8000 / 31) * 7 * 100) / 100);
 
-// Test 7: deferral — onboard 7/25 (≥20) → July deferred (payday 0), caught up in August
+// Test 7: deferral — onboard 7/25 (≥15) → July deferred (payday 0), caught up in August
 const defRec = rec({ Name: "Def", "Onboard Date": U(2026, 7, 25), "Cessation Date": U(2026, 12, 31), "薪資類別": "3個月短期" });
 const julP = computePayday(defRec, 2026, 7)!;
 check("defer: July payday total 0", julP.paydayTotal, 0);
@@ -64,10 +64,16 @@ check("defer: Aug payday = Aug + catch-up July", augP.paydayTotal, wantAug);
 console.log(`${augP.catchUp ? "PASS" : "FAIL"}  defer: Aug carries catch-up`);
 if (!augP.catchUp) fails++;
 
-// Test 8: no deferral — onboard 7/15 (<20) → paid normally in July (17 days)
-const norRec = rec({ Name: "Nor", "Onboard Date": U(2026, 7, 15), "Cessation Date": U(2026, 12, 31), "薪資類別": "3個月短期" });
+// Test 7b: boundary — onboard exactly on the 15th → deferred (cutoff is inclusive)
+const bndRec = rec({ Name: "Bnd", "Onboard Date": U(2026, 7, 15), "Cessation Date": U(2026, 12, 31), "薪資類別": "3個月短期" });
+const bndP = computePayday(bndRec, 2026, 7)!;
+console.log(`${bndP.deferredOut ? "PASS" : "FAIL"}  defer: onboard on the 15th deferred (inclusive)`);
+if (!bndP.deferredOut) fails++;
+
+// Test 8: no deferral — onboard 7/14 (<15) → paid normally in July (18 days)
+const norRec = rec({ Name: "Nor", "Onboard Date": U(2026, 7, 14), "Cessation Date": U(2026, 12, 31), "薪資類別": "3個月短期" });
 const julN = computePayday(norRec, 2026, 7)!;
-check("no-defer: July 17 days paid", julN.paydayTotal, Math.round((8000 / 31) * 17 * 100) / 100);
+check("no-defer: July 18 days paid", julN.paydayTotal, Math.round((8000 / 31) * 18 * 100) / 100);
 console.log(`${!julN.deferredOut ? "PASS" : "FAIL"}  no-defer: not flagged`);
 if (julN.deferredOut) fails++;
 

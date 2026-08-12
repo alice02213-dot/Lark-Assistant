@@ -1,5 +1,5 @@
 // Standalone monthly salary sender — can be wired to a Windows scheduled task on
-// the 20th. Idempotent via salary-sent.json, so it never double-sends even if the
+// the 15th. Idempotent via salary-sent.json, so it never double-sends even if the
 // in-process cron also fires. Run: npm run send-salary
 import dotenv from "dotenv";
 import path from "path";

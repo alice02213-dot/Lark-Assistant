@@ -11,7 +11,7 @@ const APP_TOKEN = "UbLybT4uHaJAahsZneVlYOLQgyd";
 const TABLE_ID = "tblTLJVQrrhpbZ2p";
 const INTERN_KIND = "intern";
 
-// The monthly summary goes to these people on the 20th. `key` is used only in the
+// The monthly summary goes to these people on the 15th. `key` is used only in the
 // sent-log so each person is delivered to at most once per month.
 const RECIPIENTS: { key: string; name: string; receiveId: string; idType: ReceiveIdType }[] = [
   { key: "dora", name: "Dora Huang", receiveId: "ou_d648150b253127ad14a385d808cdd947", idType: "open_id" },
@@ -215,12 +215,20 @@ export function computeRow(rec: BitableRecord, year: number, month0: number): Sa
   };
 }
 
-// --- Payday assembly (20th-of-month cut-off + deferral) -------------------------
-// Payroll runs on the 20th. An intern who onboards on/after the 20th of a month
-// misses that month's run; that (partial) month's pay is deferred and paid on the
-// NEXT payday alongside the next month's salary. This is a timing rule only — the
-// per-month amounts are still the calendar-month prorated figures from computeRow.
-const CUTOFF_DAY = 20;
+// --- Payday schedule ------------------------------------------------------------
+// Payroll is disbursed at PAYDAY_HOUR:00 (in the configured tz) on PAYDAY_DOM of each
+// month. Both the cron trigger and the startup catch-up derive from these, so the
+// schedule lives in one place.
+const PAYDAY_DOM = 15;
+const PAYDAY_HOUR = 17;
+
+// --- Payday assembly (day-of-month cut-off + deferral) --------------------------
+// An intern who onboards on/after the payday day-of-month misses that month's run;
+// that (partial) month's pay is deferred and paid on the NEXT payday alongside the
+// next month's salary. This is a timing rule only — the per-month amounts are still
+// the calendar-month prorated figures from computeRow.
+// CUTOFF_DAY is intentionally the payday day-of-month: move the payday and this moves with it.
+const CUTOFF_DAY = PAYDAY_DOM;
 
 export interface PaydayLine {
   name: string;
@@ -228,7 +236,7 @@ export interface PaydayLine {
   unset: boolean;
   onboardDay: number;
   current: SalaryRow | null; // this calendar month's pay
-  deferredOut: boolean; // current month deferred to NEXT payday (onboarded ≥20 this month)
+  deferredOut: boolean; // current month deferred to NEXT payday (onboarded ≥15 this month)
   catchUp: SalaryRow | null; // previous month's pay, caught up on this payday
   catchUpMonth: number; // 1-based previous month (for labelling)
   paydayTotal: number;
@@ -306,7 +314,7 @@ const GROUPS: { cat: Category; title: string }[] = [
   { cat: "onboard", title: "🆕 本月入職" },
   { cat: "leave", title: "🔚 本月離職" },
   { cat: "renew", title: "🔁 3+3續約" },
-  { cat: "deferred", title: "🔄 順延補發（上月下旬入職）" },
+  { cat: "deferred", title: "🔄 順延補發（上月15號後入職）" },
   { cat: "steady", title: "✅ 一般在職" },
 ];
 
@@ -316,11 +324,17 @@ function renderLine(l: PaydayLine, month: number): string {
   const label = l.track ?? "?"; // show the Base's own label (already carries the wage base)
   if (l.unset) return `• ${l.name}　⚠️ 未設定薪資類別`;
 
-  const backfillFlag = l.current && l.current.backfill > 0 ? "　✅含補差" : "";
+  // On the month the one-time backfill lands, spell out the mechanism instead of a
+  // bare "含補差": salary steps up to the long rate AND the first-3-months shortfall
+  // is repaid this month. Amounts come from the rate constants (not hard-coded).
+  const backfillFlag =
+    l.current && l.current.backfill > 0
+      ? `　✅ 第4個月：月薪轉${RATE_LONG.toLocaleString()}，另補前3個月差額＋${l.current.backfill.toLocaleString()}`
+      : "";
 
-  // Onboarded on/after the 20th this month → deferred, nothing paid now.
+  // Onboarded on/after the 15th this month → deferred, nothing paid now.
   if (l.deferredOut && !l.catchUp) {
-    return `• ${l.name}　${label}　🆕${month}/${l.onboardDay}入職（≥20號）→ 本月順延至下月一併發放`;
+    return `• ${l.name}　${label}　🆕${month}/${l.onboardDay}入職（≥15號）→ 本月順延至下月一併發放`;
   }
 
   // Plain current month, no deferral in or out.
@@ -335,7 +349,7 @@ function renderLine(l: PaydayLine, month: number): string {
   return `• ${l.name}　${label}　${segs.join("　＋　")}`;
 }
 
-/** Build the full salary report for a payday (1-based month, disbursed on the 20th).
+/** Build the full salary report for a payday (1-based month, disbursed on the 15th).
  *  Work days only (no amounts); grouped by event so like sits with like. */
 export async function buildSalaryReport(year: number, month: number): Promise<SalaryReport> {
   const records = await fetchAllRecords(TABLE_ID);
@@ -352,7 +366,7 @@ export async function buildSalaryReport(year: number, month: number): Promise<Sa
   const unsetCount = lines.filter((l) => l.unset).length;
 
   const ym = `${year}-${String(month).padStart(2, "0")}`;
-  const out: string[] = [`💰 Intern 薪資結算 ${ym}（20號發薪，${lines.length} 位）`];
+  const out: string[] = [`💰 Intern 薪資結算 ${ym}（15號發薪，${lines.length} 位）`];
 
   const byName = (a: PaydayLine, b: PaydayLine) => a.name.localeCompare(b.name);
   for (const g of GROUPS) {
@@ -362,6 +376,19 @@ export async function buildSalaryReport(year: number, month: number): Promise<Sa
     for (const l of members) out.push(renderLine(l, month));
   }
 
+  // Legend: explain the 3+3 renewal salary mechanism whenever a renewal intern is on
+  // this payday, so leadership can read the month-4 jump without prior context.
+  const hasRenew = lines.some((l) => classifyTrack(l.track) === "RENEW");
+  if (hasRenew) {
+    out.push(
+      "",
+      `※ 3+3續約薪資說明：前3個月每月 ${RATE_SHORT.toLocaleString()}，第4個月起調為每月 ${RATE_LONG.toLocaleString()}；` +
+        `並於第4個月一次補回前3個月的差額（每月 ${(RATE_LONG - RATE_SHORT).toLocaleString()} × 3 個月 ＝ ${BACKFILL.toLocaleString()}）。` +
+        `因此第4個月一般實領 ${RATE_LONG.toLocaleString()} ＋ ${BACKFILL.toLocaleString()} ＝ ${(RATE_LONG + BACKFILL).toLocaleString()}，` +
+        `第5個月起回到每月 ${RATE_LONG.toLocaleString()}（當月非整月則按實際天數比例計）。`
+    );
+  }
+
   if (unsetCount > 0) {
     out.push("", `⚠️ 有 ${unsetCount} 位尚未設定「薪資類別」，請到 Base 補上。`);
   }
@@ -369,17 +396,28 @@ export async function buildSalaryReport(year: number, month: number): Promise<Sa
   return { year, month, lines, total, unsetCount, text: out.join("\n") };
 }
 
-// --- Current payroll month in the configured timezone ---------------------------
-function currentYearMonthInTz(): { year: number; month: number; monthKey: string } {
+// --- Current payroll date/time in the configured timezone -----------------------
+function currentYearMonthInTz(): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  monthKey: string;
+} {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: config.cron.timezone,
     year: "numeric",
     month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    hour12: false,
   });
   const p = Object.fromEntries(fmt.formatToParts(new Date()).map((x) => [x.type, x.value]));
   const year = parseInt(p.year, 10);
   const month = parseInt(p.month, 10);
-  return { year, month, monthKey: `${p.year}-${p.month}` };
+  const day = parseInt(p.day, 10);
+  const hour = parseInt(p.hour === "24" ? "0" : p.hour, 10);
+  return { year, month, day, hour, monthKey: `${p.year}-${p.month}` };
 }
 
 // --- "already sent" log: { "YYYY-MM": ["recipientKey", ...] } — each recipient is
@@ -443,13 +481,30 @@ export async function sendMonthlySalary(opts?: { force?: boolean }): Promise<{
 let task: cron.ScheduledTask | null = null;
 
 export function start() {
-  // In-process cron at 09:00 on the 20th of each month, in the configured timezone.
+  // 1) In-process cron at PAYDAY_HOUR:00 on PAYDAY_DOM of each month, in the configured tz.
   task = cron.schedule(
-    "0 9 20 * *",
+    `0 ${PAYDAY_HOUR} ${PAYDAY_DOM} * *`,
     () => void sendMonthlySalary().catch((e) => console.error("[intern-salary] error:", e)),
     { timezone: config.cron.timezone }
   );
   console.log(`Intern salary scheduler started (TZ: ${config.cron.timezone})`);
+
+  // 2) Startup catch-up: if the backend boots at/after this month's payday moment
+  //    (PAYDAY_DOM at PAYDAY_HOUR:00) — e.g. the laptop was off at 17:00 on the 15th
+  //    and opened later — send this month's summary now. sendMonthlySalary is
+  //    idempotent per-recipient per-month via salary-sent.json, so a boot when it was
+  //    already sent is a harmless no-op. Only covers the CURRENT payroll month; a
+  //    multi-week outage spanning a *past* month's payday is not retroactively caught up.
+  const { day, hour } = currentYearMonthInTz();
+  const paydayPassed = day > PAYDAY_DOM || (day === PAYDAY_DOM && hour >= PAYDAY_HOUR);
+  if (paydayPassed) {
+    sendMonthlySalary()
+      .then((r) => {
+        if (r.sentTo.length > 0)
+          console.log(`[intern-salary] startup catch-up sent to ${r.sentTo.join(", ")}`);
+      })
+      .catch((e) => console.error("[intern-salary] catch-up error:", e));
+  }
 }
 
 export function stop() {

@@ -1,5 +1,5 @@
 // One-off TEST send of a salary report, WITHOUT touching the sent-log, so the real
-// 20th-of-month cron still fires normally.
+// 15th-of-month cron still fires normally.
 // Usage: ts-node send-salary-test.ts [year] [month] [recipient]
 // recipient defaults to Dora's open_id; an "@"-containing value is treated as email.
 import dotenv from "dotenv";
