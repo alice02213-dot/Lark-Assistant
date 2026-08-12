@@ -405,19 +405,6 @@ export async function buildSalaryReport(year: number, month: number): Promise<Sa
     for (const l of members) out.push(renderLine(l, month));
   }
 
-  // Legend: explain the 3+3 renewal salary mechanism whenever a renewal intern is on
-  // this payday, so leadership can read the month-4 jump without prior context.
-  const hasRenew = lines.some((l) => classifyTrack(l.track) === "RENEW");
-  if (hasRenew) {
-    out.push(
-      "",
-      `※ 3+3續約薪資說明：前3個月每月 ${RATE_SHORT.toLocaleString()}，第4個月起調為每月 ${RATE_LONG.toLocaleString()}；` +
-        `並於第4個月一次補回前3個月的差額（每月 ${(RATE_LONG - RATE_SHORT).toLocaleString()} × 3 個月 ＝ ${BACKFILL.toLocaleString()}）。` +
-        `因此第4個月一般實領 ${RATE_LONG.toLocaleString()} ＋ ${BACKFILL.toLocaleString()} ＝ ${(RATE_LONG + BACKFILL).toLocaleString()}，` +
-        `第5個月起回到每月 ${RATE_LONG.toLocaleString()}（當月非整月則按實際天數比例計）。`
-    );
-  }
-
   if (unsetCount > 0) {
     out.push("", `⚠️ 有 ${unsetCount} 位尚未設定「薪資類別」，請到 Base 補上。`);
   }
