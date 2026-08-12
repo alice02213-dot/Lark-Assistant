@@ -126,6 +126,16 @@ function monthlyRateForDay(track: string | null, monthIdx: number): number {
   }
 }
 
+// A run of consecutive active days at one monthly rate. Most months have a single
+// segment; a 3+3 intern crossing the month-3→month-4 boundary mid-month has two
+// (e.g. 8/1–8/19 at 8000, 8/20–8/31 at 10000).
+export interface RateSegment {
+  from: number; // day-of-month
+  to: number; // day-of-month
+  days: number;
+  rate: number; // monthly rate basis (8000 or 10000)
+}
+
 export interface SalaryRow {
   name: string;
   track: string | null;
@@ -133,6 +143,7 @@ export interface SalaryRow {
   daysInMonth: number;
   activeFrom: number; // first active day-of-month (0 if none)
   activeTo: number; // last active day-of-month (0 if none)
+  segments: RateSegment[]; // rate-tier breakdown of the active days
   fullMonth: boolean;
   base: number; // prorated base pay (excludes backfill)
   backfill: number; // 0 or 6000
@@ -170,6 +181,8 @@ export function computeRow(rec: BitableRecord, year: number, month0: number): Sa
   let activeDays = 0;
   let activeFrom = 0; // first active day-of-month
   let activeTo = 0; // last active day-of-month
+  const segments: RateSegment[] = [];
+  let seg: RateSegment | null = null;
   for (let day = 1; day <= daysInMonth; day++) {
     const dayMs = Date.UTC(year, month0, day);
     if (dayMs < onboard || dayMs > effCessation) continue;
@@ -178,7 +191,16 @@ export function computeRow(rec: BitableRecord, year: number, month0: number): Sa
     activeTo = day;
     if (!unset) {
       const idx = contractMonthIndex(onboard, dayMs);
-      base += monthlyRateForDay(track!, idx) / daysInMonth;
+      const rate = monthlyRateForDay(track!, idx);
+      base += rate / daysInMonth;
+      // Extend the current segment if the rate and days stay contiguous, else start one.
+      if (seg && seg.rate === rate && seg.to === day - 1) {
+        seg.to = day;
+        seg.days++;
+      } else {
+        seg = { from: day, to: day, days: 1, rate };
+        segments.push(seg);
+      }
     }
   }
 
@@ -205,6 +227,7 @@ export function computeRow(rec: BitableRecord, year: number, month0: number): Sa
     daysInMonth,
     activeFrom,
     activeTo,
+    segments,
     fullMonth: activeDays === daysInMonth,
     base: round2(base),
     backfill,
@@ -292,8 +315,17 @@ export interface SalaryReport {
   text: string;
 }
 
-/** Describe the active days of a monthly row, e.g. "整月" or "做7天（8/1–8/7，當月共31天）". */
+const rateTag = (rate: number): string => `${Math.round(rate / 1000)}k`;
+
+/** Describe the active days of a monthly row. Single rate → "整月" / "做7天（…）".
+ *  Mid-month rate change (3+3 month-4 boundary) → each segment with its rate tier,
+ *  e.g. "8/1–8/19 做19天(8k)　＋　8/20–8/31 做12天(10k)". */
 function daysDesc(row: SalaryRow, monthNum: number): string {
+  if (row.segments.length > 1) {
+    return row.segments
+      .map((s) => `${monthNum}/${s.from}–${monthNum}/${s.to} 做${s.days}天(${rateTag(s.rate)})`)
+      .join("　＋　");
+  }
   if (row.fullMonth) return "整月";
   return `做${row.activeDays}天（${monthNum}/${row.activeFrom}–${monthNum}/${row.activeTo}，當月共${row.daysInMonth}天）`;
 }
@@ -324,13 +356,10 @@ function renderLine(l: PaydayLine, month: number): string {
   const label = l.track ?? "?"; // show the Base's own label (already carries the wage base)
   if (l.unset) return `• ${l.name}　⚠️ 未設定薪資類別`;
 
-  // On the month the one-time backfill lands, spell out the mechanism instead of a
-  // bare "含補差": salary steps up to the long rate AND the first-3-months shortfall
-  // is repaid this month. Amounts come from the rate constants (not hard-coded).
+  // On the month the one-time backfill lands, add it as a compact "＋ 補差6000"
+  // part — the rate step (8k→10k) is already visible in the day segments.
   const backfillFlag =
-    l.current && l.current.backfill > 0
-      ? `　✅ 第4個月：月薪轉${RATE_LONG.toLocaleString()}，另補前3個月差額＋${l.current.backfill.toLocaleString()}`
-      : "";
+    l.current && l.current.backfill > 0 ? `　＋　補差${l.current.backfill.toLocaleString()}` : "";
 
   // Onboarded on/after the 15th this month → deferred, nothing paid now.
   if (l.deferredOut && !l.catchUp) {
